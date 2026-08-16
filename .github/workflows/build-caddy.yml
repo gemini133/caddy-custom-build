@@ -1,0 +1,167 @@
+name: Build Custom Caddy with Popular Plugins
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 1 * *'  # 每月1号 UTC 02:00 (北京时间 10:00) 运行
+
+# 创建 Release 需要 'contents: write' 权限
+permissions:
+  contents: write
+
+concurrency:
+  group: caddy-build
+  cancel-in-progress: true
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      latest_tag: ${{ steps.tag.outputs.latest_tag }}
+      release_exists: ${{ steps.tag.outputs.release_exists }}
+    steps:
+      - name: 获取最新 Caddy 标签并检查 Release 是否存在
+        id: tag
+        run: |
+          latest=$(curl -fsSL "https://api.github.com/repos/caddyserver/caddy/releases/latest" | jq -r '.tag_name')
+          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+            echo "::error::无法获取 Caddy 最新版本号"
+            exit 1
+          fi
+          # 通过检查 HTTP 状态码，判断当前仓库是否已存在该 Release
+          code=$(curl -s -o /dev/null -w "%{http_code}" "https://api.github.com/repos/${{ github.repository }}/releases/tags/$latest")
+          echo "latest_tag=$latest" >> "$GITHUB_OUTPUT"
+          echo "release_exists=$(if [ "$code" -eq 200 ]; then echo true; else echo false; fi)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.release_exists != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      GO_VERSION: 'stable'
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v7
+
+      - name: 设置 Go 环境
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: 安装 xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      - name: 构建 linux/${{ matrix.arch }} 版本
+        run: |
+          set -e
+          latest_tag='${{ needs.resolve.outputs.latest_tag }}'
+          echo "--- 开始为 linux/${{ matrix.arch }} 构建 Caddy v${latest_tag#v} ---"
+
+          GOOS=linux GOARCH=${{ matrix.arch }} xcaddy build "$latest_tag" \
+            --with github.com/caddy-dns/cloudflare \
+            --with github.com/caddy-dns/alidns \
+            --with github.com/caddy-dns/tencentcloud \
+            --with github.com/mholt/caddy-ratelimit \
+            --with github.com/greenpau/caddy-security \
+            --with github.com/mholt/caddy-l4 \
+            --with github.com/mholt/caddy-dynamicdns \
+            --with github.com/mholt/caddy-webdav \
+            --with github.com/caddyserver/cache-handler \
+            --with github.com/zhangjiayin/caddy-geoip2 \
+            --with github.com/WeidiDeng/caddy-cloudflare-ip \
+            --output ./caddy
+
+      # 仅在 amd64 上执行本地验证（arm64 为交叉编译产物，无法在 amd64 runner 上直接运行）
+      # 由于两个架构使用相同的源码与插件集，amd64 验证通过即可保证插件集成正确性
+      - name: 验证内置插件 (仅 amd64)
+        if: matrix.arch == 'amd64'
+        run: |
+          set -e
+          echo "正在验证 amd64 二进制文件中的内置插件..."
+          MODULES=$(./caddy list-modules)
+
+          CHECK_MODULES=(
+            "dns.providers.cloudflare"
+            "dns.providers.alidns"
+            "dns.providers.tencentcloud"
+            "http.handlers.rate_limit"
+            "security"
+            "layer4"
+            "dynamic_dns"
+            "http.handlers.webdav"
+            "http.handlers.cache"
+            "http.handlers.geoip2"
+            "http.ip_sources.cloudflare"
+          )
+
+          for mod in "${CHECK_MODULES[@]}"; do
+            if ! echo "$MODULES" | grep -Fq "$mod"; then
+              echo "错误：未找到插件模块 $mod ！"
+              exit 1
+            fi
+            echo "  ✓ 校验通过: $mod"
+          done
+          echo "所有 11 个插件验证成功。"
+
+      - name: 打包并计算校验和
+        run: |
+          set -e
+          latest_tag='${{ needs.resolve.outputs.latest_tag }}'
+          version="${latest_tag#v}"
+          filename="caddy-${version}-linux-${{ matrix.arch }}.tar.gz"
+          tar -czf "$filename" caddy
+          sha256sum "$filename" > "${filename}.sha256"
+          mkdir -p ./artifacts
+          mv "$filename" "${filename}.sha256" ./artifacts/
+          rm ./caddy
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: caddy-${{ matrix.arch }}
+          path: ./artifacts/
+
+  release:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.release_exists != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          pattern: caddy-*
+          merge-multiple: true
+          path: ./release-files
+
+      - name: 准备 Release 内容
+        id: prep_body
+        run: |
+          build_time="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+          {
+            echo "body<<EOF"
+            echo "基于 Caddy 官方源码，集成 11 个常用插件。"
+            echo ""
+            echo "- **Caddy 版本**: ${{ needs.resolve.outputs.latest_tag }}"
+            echo "- **构建架构**: amd64, arm64"
+            echo "- **构建时间**: ${build_time}"
+            echo "- **内置插件**: Cloudflare DNS, Aliyun DNS, Tencent Cloud DNS, Rate Limit, Security, Layer 4, Dynamic DNS, WebDAV, Cache Handler, GeoIP2, Cloudflare IP Ranges"
+            echo "- **官方源码**: https://github.com/caddyserver/caddy"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.resolve.outputs.latest_tag }}
+          name: "Caddy ${{ needs.resolve.outputs.latest_tag }} with Popular Plugins"
+          body: ${{ steps.prep_body.outputs.body }}
+          files: ./release-files/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
