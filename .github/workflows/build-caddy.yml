@@ -74,6 +74,7 @@ jobs:
             --with github.com/mholt/caddy-dynamicdns \
             --with github.com/mholt/caddy-webdav \
             --with github.com/caddyserver/cache-handler \
+            --with github.com/darkweak/storages/badger/caddy \
             --with github.com/zhangjiayin/caddy-geoip2 \
             --with github.com/WeidiDeng/caddy-cloudflare-ip \
             --output ./caddy
@@ -97,6 +98,7 @@ jobs:
             "dynamic_dns"
             "http.handlers.webdav"
             "http.handlers.cache"
+            "storages.cache.badger"
             "http.handlers.geoip2"
             "http.ip_sources.cloudflare"
           )
@@ -108,7 +110,7 @@ jobs:
             fi
             echo "  ✓ 校验通过: $mod"
           done
-          echo "所有 11 个插件验证成功。"
+          echo "所有 12 个插件验证成功。"
 
       - name: 打包并计算校验和
         run: |
@@ -146,12 +148,12 @@ jobs:
           build_time="$(date '+%Y-%m-%d %H:%M:%S %Z')"
           {
             echo "body<<EOF"
-            echo "基于 Caddy 官方源码，集成 11 个常用插件。"
+            echo "基于 Caddy 官方源码，集成 12 个常用插件。"
             echo ""
             echo "- **Caddy 版本**: ${{ needs.resolve.outputs.latest_tag }}"
             echo "- **构建架构**: amd64, arm64"
             echo "- **构建时间**: ${build_time}"
-            echo "- **内置插件**: Cloudflare DNS, Aliyun DNS, Tencent Cloud DNS, Rate Limit, Security, Layer 4, Dynamic DNS, WebDAV, Cache Handler, GeoIP2, Cloudflare IP Ranges"
+            echo "- **内置插件**: Cloudflare DNS, Aliyun DNS, Tencent Cloud DNS, Rate Limit, Security, Layer 4, Dynamic DNS, WebDAV, Cache Handler, Badger Storage, GeoIP2, Cloudflare IP Ranges"
             echo "- **官方源码**: https://github.com/caddyserver/caddy"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
